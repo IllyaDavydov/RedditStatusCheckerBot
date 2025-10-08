@@ -221,8 +221,21 @@ async def auto_check():
             print("auto_check error:", e)
         await asyncio.sleep(300)
 
+async def health(request):
+    return web.Response(text="ok")
+
+async def run_http_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 
 async def main():
+    asyncio.create_task(run_http_server())   # <— добавили
     asyncio.create_task(auto_check())
     await dp.start_polling(bot)
 
