@@ -10,7 +10,10 @@ from aiogram.enums import ParseMode
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STATUS_URL = "https://www.redditstatus.com/api/v2/summary.json"
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+from aiogram.client.default import DefaultBotProperties
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
 dp = Dispatcher()
 
 LANGS = {
