@@ -4,7 +4,7 @@ import asyncio
 import datetime as dt
 import httpx
 import matplotlib.pyplot as plt
-from aiogram.types import BufferedInputFile
+from aiogram.types.input_file import BufferedInputFile
 from aiohttp import web
 from aiogram.filters import Command
 from aiogram import Bot, Dispatcher, types
@@ -114,18 +114,24 @@ async def status_cmd(msg: types.Message):
 
 @dp.message(Command(commands=["graph"]))
 async def graph_cmd(msg: types.Message):
-    if not status_cache["history"]:
-    data = await fetch_status()
-    incidents = data.get("incidents", [])
-    count = len([i for i in incidents if i["status"] != "resolved"])
-    status_cache["history"].append((dt.datetime.utcnow(), count))
+    lang = "ru" if (msg.from_user.language_code or "").startswith("ru") else "en"
 
-    lang = "ru" if msg.from_user.language_code.startswith("ru") else "en"
+    # если данных ещё нет — добавим первую точку
+    if not status_cache["history"]:
+        data = await fetch_status()
+        incidents = data.get("incidents", [])
+        count = len([i for i in incidents if i["status"] != "resolved"])
+        status_cache["history"].append((dt.datetime.utcnow(), count))
+
     buf = plot_history(lang)
     if not buf:
         await msg.answer("Пока нет данных / No data yet.")
         return
-await msg.answer_photo(BufferedInputFile(buf.getvalue(), filename="reddit_graph.png"))
+
+    await msg.answer_photo(
+        BufferedInputFile(buf.getvalue(), filename="reddit_graph.png")
+    )
+
 
 
 async def auto_check():
