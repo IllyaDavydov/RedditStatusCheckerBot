@@ -1,6 +1,6 @@
 # main.py — RedditStatusCheckerBot
-# График "Reports (24h)" по упоминаниям "reddit down / is reddit down"
-# Источники: Reddit OAuth Search (надёжно) + fallback на публичный search.json
+# График "Reports (24h)" по фразам "reddit down / is reddit down" и их RU-аналогам
+# Источники: Reddit OAuth Search (надежно) + fallback на публичный search.json
 # Статус: официальный Reddit Status. Aiogram v3. Render-friendly.
 
 import os
@@ -35,10 +35,10 @@ if not BOT_TOKEN:
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 
-USER_AGENT = os.getenv("USER_AGENT", "RedditStatusCheckerBot/1.2 (+https://example.com)")
+USER_AGENT = os.getenv("USER_AGENT", "RedditStatusCheckerBot/1.3 (+https://example.com)")
 
 # Для Render Web Service
-ENABLE_HTTP = os.getenv("ENABLE_HTTP", "1") == "1"  # оставь 1 для веб-сервиса; можно 0 для воркера
+ENABLE_HTTP = os.getenv("ENABLE_HTTP", "1") == "1"  # 1 для веб-сервиса; 0 для воркера
 PORT = int(os.getenv("PORT", "10000"))
 
 # ========= URLs =========
@@ -130,7 +130,7 @@ async def get_reddit_token() -> str | None:
 
 # ========= Reports series (24h) =========
 def _bucket_by_hour(children: list) -> dict:
-    """Группируем посты по часам UTC; ожидаем поле data.created_utc."""
+    """Группируем посты/комменты по часам UTC; ожидаем поле data.created_utc."""
     buckets = {}
     for it in children:
         d = it.get("data", {})
@@ -141,10 +141,10 @@ def _bucket_by_hour(children: list) -> dict:
         buckets[t] = buckets.get(t, 0) + 1
     return buckets
 
-async def _fetch_public_search_last_24h() -> list:
+async def _fetch_public_search_last_24h(phrases: list[str]) -> list:
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     params = {
-        "q": "(reddit down) OR (is reddit down)",
+        "q": "(" + " OR ".join([f'"{p}"' for p in phrases]) + ")",
         "sort": "new",
         "t": "day",
         "limit": 250,
@@ -157,8 +157,8 @@ async def _fetch_public_search_last_24h() -> list:
             return []
         return (r.json() or {}).get("data", {}).get("children", [])
 
-async def _fetch_oauth_search_last_24h() -> list:
-    """Через OAuth: Cloudsearch с фильтром по timestamp за 24 часа; пагинация до ~5 страниц."""
+async def _oauth_search(types: list[str], phrases: list[str]) -> list:
+    """OAuth search: типы: 'link'|'self'|'comment'. Пагинация до ~6 страниц на тип."""
     token = await get_reddit_token()
     if not token:
         return []
@@ -167,56 +167,64 @@ async def _fetch_oauth_search_last_24h() -> list:
         "Accept": "application/json",
         "Authorization": f"bearer {token}",
     }
-    now_ts = int(_now_utc().timestamp())
+    now_ts = int(_now_utc().replace(minute=0, second=0, microsecond=0).timestamp())
     start_ts = now_ts - 24 * 3600
-    params = {
-        "q": f"(reddit down) OR (is reddit down) AND timestamp:{start_ts}..{now_ts}",
-        "syntax": "cloudsearch",
-        "sort": "new",
-        "limit": 100,
-        "type": "link",
-        "raw_json": 1,
-    }
     items = []
     async with httpx.AsyncClient(timeout=20, headers=headers) as c:
-        after = None
-        for _ in range(5):
-            pr = dict(params)
-            if after:
-                pr["after"] = after
-            r = await c.get(OAUTH_SEARCH_URL, params=pr)
-            if r.status_code != 200:
-                break
-            d = r.json().get("data", {})
-            kids = d.get("children", []) or []
-            items.extend(kids)
-            after = d.get("after")
-            if not after:
-                break
+        for t in types:
+            after = None
+            for _ in range(6):
+                query = "(" + " OR ".join([f'"{p}"' for p in phrases]) + f") AND timestamp:{start_ts}..{now_ts}"
+                params = {
+                    "q": query,
+                    "syntax": "cloudsearch",
+                    "sort": "new",
+                    "limit": 100,
+                    "type": t,
+                    "raw_json": 1,
+                }
+                if after:
+                    params["after"] = after
+                r = await c.get(OAUTH_SEARCH_URL, params=params)
+                if r.status_code != 200:
+                    break
+                d = r.json().get("data", {})
+                kids = d.get("children", []) or []
+                items.extend(kids)
+                after = d.get("after")
+                if not after:
+                    break
     return items
 
 async def fetch_reports_series_24h() -> list[tuple[dt.datetime, int]]:
     """
-    Пытаемся через OAuth; если пусто/ошибка — фолбэк на публичный поиск.
-    Возвращаем [(час, количество)], непрерывная шкала за 24 часа.
+    Считаем Reports по постам И комментариям на Reddit за 24 часа.
+    Ключевые фразы EN/RU. Сначала OAuth, затем fallback на публичный.
     """
+    phrases = [
+        "reddit down", "is reddit down", "reddit not working", "reddit outage",
+        "реддит не работает", "упал реддит", "reddit лежит"
+    ]
+
     items: list = []
     try:
-        items = await _fetch_oauth_search_last_24h()
-        if not items:
-            items = await _fetch_public_search_last_24h()
+        # посты (link/self) + комментарии
+        items = await _oauth_search(["link", "self", "comment"], phrases)
     except Exception:
+        items = []
+
+    if not items:
         try:
-            items = await _fetch_public_search_last_24h()
+            items = await _fetch_public_search_last_24h(phrases)
         except Exception:
             items = []
 
     buckets = _bucket_by_hour(items)
-    now = _now_utc().replace(minute=0, second=0, microsecond=0)
-    start = now - dt.timedelta(hours=24)
+    now_dt = _now_utc().replace(minute=0, second=0, microsecond=0)
+    start = now_dt - dt.timedelta(hours=24)
     series = []
     cur = start
-    while cur <= now:
+    while cur <= now_dt:
         series.append((cur, buckets.get(cur, 0)))
         cur += dt.timedelta(hours=1)
     return series
