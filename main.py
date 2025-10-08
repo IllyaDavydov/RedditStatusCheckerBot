@@ -22,6 +22,10 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types.input_file import BufferedInputFile
 
+import time
+
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 
 # ==== Настройки через переменные окружения ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -181,35 +185,94 @@ async def status_cmd(msg: types.Message):
     data = await fetch_status_summary()
     description = data["status"]["description"]
     ok = "Operational" in description
+_token_cache = {"access_token": None, "exp": 0}
+
+async def get_reddit_token() -> str | None:
+    if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+        return None
+    now = time.time()
+    if _token_cache["access_token"] and now < _token_cache["exp"] - 60:
+        return _token_cache["access_token"]
+    auth = httpx.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+    data = {"grant_type": "client_credentials"}
+    headers = {"User-Agent": USER_AGENT}
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post("https://www.reddit.com/api/v1/access_token",
+                         auth=auth, data=data, headers=headers)
+        r.raise_for_status()
+        j = r.json()
+    _token_cache["access_token"] = j["access_token"]
+    _token_cache["exp"] = now + j.get("expires_in", 3600)
+    return _token_cache["access_token"]
 
     # 2) серия Reports за 24ч
-    series = await fetch_reports_series_24h()
-    buf = plot_reports(series, lang)
-    if not buf:
-        await msg.answer(LANGS[lang]["no_data"])
-        return
+    async def fetch_reports_series_24h() -> list[tuple[dt.datetime, int]]:
+    """
+    Пытаемся через официальный OAuth (надёжно). Если ключей нет — падаем
+    обратно на публичный search.json как раньше.
+    """
+    now_ts = int(_now_utc().timestamp())
+    hour_ago = now_ts - 24 * 3600
 
-    reports_last_hour = series[-1][1] if series else 0
-    now = _now_utc()
+    token = await get_reddit_token()
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
-    caption = (
-        f"{LANGS[lang]['status_ok'] if ok else LANGS[lang]['status_down']}\n\n"
-        f"🌐 {description}\n"
-        f"📊 {LANGS[lang]['reports']}: {reports_last_hour}\n"
-        f"🕒 {LANGS[lang]['date']}: {now.strftime('%Y-%m-%d %H:%M')}"
-    )
+    items = []
+    try:
+        if token:
+            headers["Authorization"] = f"bearer {token}"
+            # cloudsearch-синтаксис: фильтр по времени
+            params = {
+                "q": f"(reddit down) OR (is reddit down) AND timestamp:{hour_ago}..{now_ts}",
+                "syntax": "cloudsearch",
+                "sort": "new",
+                "limit": 100,
+                "type": "link",
+            }
+            url = "https://oauth.reddit.com/search"
+            async with httpx.AsyncClient(timeout=20, headers=headers) as c:
+                after = None
+                for _ in range(5):  # до 5 страниц
+                    pr = dict(params)
+                    if after:
+                        pr["after"] = after
+                    r = await c.get(url, params=pr)
+                    if r.status_code != 200:
+                        break
+                    d = r.json().get("data", {})
+                    kids = d.get("children", [])
+                    items.extend(kids)
+                    after = d.get("after")
+                    if not after:
+                        break
+        else:
+            # fallback: публичный search.json (может 429/403)
+            params = {
+                "q": "(reddit down) OR (is reddit down)",
+                "sort": "new",
+                "t": "day",
+                "limit": 250,
+                "restrict_sr": "0",
+                "raw_json": 1,
+            }
+            async with httpx.AsyncClient(timeout=20, headers=headers) as c:
+                r = await c.get(SEARCH_URL, params=params)
+                if r.status_code == 200:
+                    items = (r.json() or {}).get("data", {}).get("children", [])
+    except Exception:
+        items = []
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Web version", url="https://downdetector.com/status/reddit/")]
-        ]
-    )
+    # сгруппировать по часам
+    buckets = _bucket_by_hour(items)
+    now = _now_utc().replace(minute=0, second=0, microsecond=0)
+    start = now - dt.timedelta(hours=24)
+    series = []
+    cur = start
+    while cur <= now:
+        series.append((cur, buckets.get(cur, 0)))
+        cur += dt.timedelta(hours=1)
+    return series
 
-    await msg.answer_photo(
-        BufferedInputFile(buf.getvalue(), filename="reports_24h.png"),
-        caption=caption,
-        reply_markup=kb
-    )
 
 
 @dp.message(Command(commands=["graph"]))
