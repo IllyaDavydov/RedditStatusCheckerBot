@@ -4,9 +4,22 @@ import asyncio
 import datetime as dt
 import httpx
 import matplotlib.pyplot as plt
+from aiohttp import web
 from aiogram.filters import Command
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
+
+async def health(request):
+    return web.Response(text="ok")
+
+async def run_http_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STATUS_URL = "https://www.redditstatus.com/api/v2/summary.json"
@@ -130,6 +143,7 @@ async def auto_check():
 
 
 async def main():
+    asyncio.create_task(run_http_server())   # <— добавили строку
     asyncio.create_task(auto_check())
     await dp.start_polling(bot)
 
