@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import httpx
 import matplotlib.pyplot as plt
+from aiogram.filters import Command
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 
@@ -61,7 +62,7 @@ def plot_history(lang="en"):
     return buf
 
 
-@dp.message(commands=["start", "help"])
+@dp.message(Command(commands=["start", "help"]))
 async def start(msg: types.Message):
     lang = "ru" if msg.from_user.language_code.startswith("ru") else "en"
     await msg.answer(
@@ -76,7 +77,7 @@ async def start(msg: types.Message):
     )
 
 
-@dp.message(commands=["status"])
+@dp.message(Command(commands=["status"]))
 async def status_cmd(msg: types.Message):
     lang = "ru" if msg.from_user.language_code.startswith("ru") else "en"
     data = await fetch_status()
@@ -97,7 +98,7 @@ async def status_cmd(msg: types.Message):
     await msg.answer(text)
 
 
-@dp.message(commands=["graph"])
+@dp.message(Command(commands=["graph"]))
 async def graph_cmd(msg: types.Message):
     lang = "ru" if msg.from_user.language_code.startswith("ru") else "en"
     buf = plot_history(lang)
