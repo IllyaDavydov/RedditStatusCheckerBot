@@ -5,6 +5,7 @@ import datetime as dt
 import httpx
 import matplotlib.pyplot as plt
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
