@@ -1,11 +1,20 @@
+# main.py — RedditStatusCheckerBot (Reports из Reddit, статус из Reddit Status)
+# Работает на aiogram v3. Подходит и для Render Web Service (с health-сервером).
+
 import os
 import io
+import math
 import asyncio
 import datetime as dt
+
 import httpx
+
+import matplotlib
+matplotlib.use("Agg")  # безопасный бэкенд для хостинга без дисплея
 import matplotlib.pyplot as plt
 
 from aiohttp import web
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -13,99 +22,65 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types.input_file import BufferedInputFile
 
+
+# ==== Настройки через переменные окружения ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-STATUS_URL = "https://www.redditstatus.com/api/v2/summary.json"
-USER_AGENT = os.getenv("USER_AGENT", "RedditStatusCheckerBot/1.0 (+https://example.com)")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+USER_AGENT = os.getenv("USER_AGENT", "RedditStatusCheckerBot/1.1 (+https://example.com)")
+ENABLE_HTTP = os.getenv("ENABLE_HTTP", "1") == "1"  # для Render Web Service по умолчанию включено
+PORT = int(os.getenv("PORT", "10000"))
 
+# ==== Источники данных ====
+STATUS_URL = "https://www.redditstatus.com/api/v2/summary.json"  # официальный статус
+SEARCH_URL = "https://www.reddit.com/search.json"                # публичный поиск (без OAuth)
+
+# ==== Локализация (RU/EN) ====
 LANGS = {
     "ru": {
         "status_ok": "✅ Reddit работает нормально.",
         "status_down": "⚠️ Проблемы на Reddit!",
-        "title": "График сбоев Reddit",
-        "x_label": "Время",
-        "y_label": "Количество инцидентов",
+        "title": "Reports (24ч)",
+        "x_label": "Время (UTC)",
+        "y_label": "Reports",
         "reports": "Reports (за час)",
-        "incidents": "Активных инцидентов",
         "no_data": "Пока нет данных / No data yet.",
         "web": "Web version",
         "date": "Дата (UTC)",
+        "help": (
+            "👋 Привет! Я показываю статус Reddit и график 'Reports'.\n\n"
+            "Команды:\n"
+            "/status — статус + график Reports (24ч)\n"
+            "/graph — только график Reports (24ч)"
+        ),
     },
     "en": {
         "status_ok": "✅ Reddit is operating normally.",
         "status_down": "⚠️ Reddit seems to be having issues!",
-        "title": "Reddit Outage Graph",
-        "x_label": "Time",
-        "y_label": "Incident Count",
+        "title": "Reports (24h)",
+        "x_label": "Time (UTC)",
+        "y_label": "Reports",
         "reports": "Reports (last hour)",
-        "incidents": "Active incidents",
         "no_data": "No data yet.",
         "web": "Web version",
         "date": "Date (UTC)",
+        "help": (
+            "👋 Hi! I show Reddit status and a 'Reports' graph.\n\n"
+            "Commands:\n"
+            "/status — status + Reports graph (24h)\n"
+            "/graph — Reports graph (24h) only"
+        ),
     },
 }
 
-status_cache = {"last_status": None, "history": []}
+# ==== Инициализация бота ====
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
 
-async def fetch_status():
-    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": USER_AGENT}) as client:
-        r = await client.get(STATUS_URL)
-        r.raise_for_status()
-        return r.json()
-
-
-async def fetch_reports_last_hour():
-    """
-    Простейшая метрика 'Reports': кол-во свежих постов по запросу
-    'reddit down' ИЛИ 'is reddit down' за последний час.
-    Без OAuth, через публичный поиск reddit.com (может ограничиваться rate-limit).
-    Если не получилось — вернём None.
-    """
-    url = "https://www.reddit.com/search.json"
-    params = {
-        "q": "(reddit down) OR (is reddit down)",
-        "sort": "new",
-        "t": "hour",
-        "limit": 100,
-        "restrict_sr": "0",
-        "include_over_18": "on",
-    }
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=15, headers=headers) as client:
-            r = await client.get(url, params=params)
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            children = (data or {}).get("data", {}).get("children", [])
-            return len(children)
-    except Exception:
-        return None
-
-
-def _now_utc():
+def _now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
-
-
-def plot_history(lang="en"):
-    if not status_cache["history"]:
-        return None
-    times = [x[0] for x in status_cache["history"]]
-    values = [x[1] for x in status_cache["history"]]
-    plt.figure(figsize=(6, 3))
-    plt.plot(times, values, marker="o")
-    plt.title(LANGS[lang]["title"])
-    plt.xlabel(LANGS[lang]["x_label"])
-    plt.ylabel(LANGS[lang]["y_label"])
-    plt.grid(True, alpha=0.3)
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    buf.seek(0)
-    plt.close()
-    return buf
 
 
 def _lang(msg: types.Message) -> str:
@@ -113,64 +88,125 @@ def _lang(msg: types.Message) -> str:
     return "ru" if lc.startswith("ru") else "en"
 
 
+# ---------- Официальный статус Reddit ----------
+async def fetch_status_summary() -> dict:
+    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": USER_AGENT}) as c:
+        r = await c.get(STATUS_URL)
+        r.raise_for_status()
+        return r.json()
+
+
+# ---------- Reports из Reddit-поиска ----------
+def _bucket_by_hour(children: list) -> dict:
+    """Группируем посты по часу (UTC)."""
+    buckets = {}
+    for it in children:
+        d = it.get("data", {})
+        ts = d.get("created_utc")
+        if ts is None:
+            continue
+        t = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        buckets[t] = buckets.get(t, 0) + 1
+    return buckets
+
+
+async def fetch_reports_series_24h() -> list[tuple[dt.datetime, int]]:
+    """
+    Возвращает [(t_hour, count), ...] за последние 24 часа
+    по запросу '(reddit down) OR (is reddit down)'.
+    """
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    params = {
+        "q": "(reddit down) OR (is reddit down)",
+        "sort": "new",
+        "t": "day",
+        "limit": 250,        # максимум результатов на выдачу
+        "restrict_sr": "0",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20, headers=headers) as c:
+            r = await c.get(SEARCH_URL, params=params)
+            if r.status_code != 200:
+                return []
+            data = r.json() or {}
+            children = data.get("data", {}).get("children", [])
+    except Exception:
+        return []
+
+    buckets = _bucket_by_hour(children)
+    now = _now_utc().replace(minute=0, second=0, microsecond=0)
+    start = now - dt.timedelta(hours=24)
+
+    series = []
+    cur = start
+    while cur <= now:
+        series.append((cur, buckets.get(cur, 0)))
+        cur += dt.timedelta(hours=1)
+    return series
+
+
+# ---------- Рендер графика ----------
+def plot_reports(points: list[tuple[dt.datetime, int]], lang: str = "en") -> io.BytesIO | None:
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+
+    plt.figure(figsize=(6, 3))
+    plt.plot(xs, ys, marker="o")
+    plt.title(LANGS[lang]["title"])
+    plt.xlabel(LANGS[lang]["x_label"])
+    plt.ylabel(LANGS[lang]["y_label"])
+    plt.grid(True, alpha=0.3)
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    plt.close()
+    return buf
+
+
+# ---------- Команды ----------
 @dp.message(Command(commands=["start", "help"]))
-async def start(msg: types.Message):
-    await msg.answer(
-        "👋 Привет! Я показываю статус Reddit и графики сбоев.\n\n"
-        "Команды:\n"
-        "/status — текущее состояние + график\n"
-        "/graph — график за последние 24 часа\n\n"
-        "👋 Hi! I show Reddit's current status and outage graphs.\n\n"
-        "Commands:\n"
-        "/status — current status + graph\n"
-        "/graph — outage graph (24h)"
-    )
+async def start_cmd(msg: types.Message):
+    lang = _lang(msg)
+    await msg.answer(LANGS[lang]["help"])
 
 
 @dp.message(Command(commands=["status"]))
 async def status_cmd(msg: types.Message):
     lang = _lang(msg)
 
-    # 1) тянем статус
-    data = await fetch_status()
+    # 1) статус Reddit (официальный)
+    data = await fetch_status_summary()
     description = data["status"]["description"]
-    incidents = data.get("incidents", [])
-    open_count = len([i for i in incidents if i["status"] != "resolved"])
+    ok = "Operational" in description
 
-    # 2) обновляем историю (5-минутная сетка)
-    now = _now_utc()
-    status_cache["history"].append((now, open_count))
-    status_cache["history"] = status_cache["history"][-288:]  # ~24h при шаге 5 минут
-
-    # 3) готовим график (если нет данных — добавим стартовую точку)
-    if not status_cache["history"]:
-        status_cache["history"].append((now, open_count))
-    buf = plot_history(lang)
+    # 2) серия Reports за 24ч
+    series = await fetch_reports_series_24h()
+    buf = plot_reports(series, lang)
     if not buf:
         await msg.answer(LANGS[lang]["no_data"])
         return
 
-    # 4) считаем "Reports" (упоминания за час) — может быть None
-    reports = await fetch_reports_last_hour()
-    rep_str = str(reports) if isinstance(reports, int) else "—"
+    reports_last_hour = series[-1][1] if series else 0
+    now = _now_utc()
 
-    # 5) текст подписи (caption)
-    ok = "Operational" in description
-    header = LANGS[lang]["status_ok"] if ok else LANGS[lang]["status_down"]
     caption = (
-        f"{header}\n\n"
+        f"{LANGS[lang]['status_ok'] if ok else LANGS[lang]['status_down']}\n\n"
         f"🌐 {description}\n"
-        f"📊 {LANGS[lang]['reports']}: {rep_str}\n"
-        f"🧰 {LANGS[lang]['incidents']}: {open_count}\n"
+        f"📊 {LANGS[lang]['reports']}: {reports_last_hour}\n"
         f"🕒 {LANGS[lang]['date']}: {now.strftime('%Y-%m-%d %H:%M')}"
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=LANGS[lang]["web"], url="https://www.redditstatus.com/")]
-    ])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Web version", url="https://downdetector.com/status/reddit/")]
+        ]
+    )
 
     await msg.answer_photo(
-        BufferedInputFile(buf.getvalue(), filename="reddit_graph.png"),
+        BufferedInputFile(buf.getvalue(), filename="reports_24h.png"),
         caption=caption,
         reply_markup=kb
     )
@@ -179,66 +215,34 @@ async def status_cmd(msg: types.Message):
 @dp.message(Command(commands=["graph"]))
 async def graph_cmd(msg: types.Message):
     lang = _lang(msg)
-
-    # если данных ещё нет — снимем текущее состояние и добавим точку
-    if not status_cache["history"]:
-        data = await fetch_status()
-        incidents = data.get("incidents", [])
-        count = len([i for i in incidents if i["status"] != "resolved"])
-        status_cache["history"].append((_now_utc(), count))
-
-    buf = plot_history(lang)
+    series = await fetch_reports_series_24h()
+    buf = plot_reports(series, lang)
     if not buf:
         await msg.answer(LANGS[lang]["no_data"])
         return
-
-    await msg.answer_photo(
-        BufferedInputFile(buf.getvalue(), filename="reddit_graph.png")
-    )
+    await msg.answer_photo(BufferedInputFile(buf.getvalue(), filename="reports_24h.png"))
 
 
-async def auto_check():
-    """Фоновая проверка раз в 5 минут (для истории и будущих алертов)."""
-    alert_chat = os.getenv("ALERT_CHAT_ID")  # можно задать chat_id или @channel
-    while True:
-        try:
-            data = await fetch_status()
-            description = data["status"]["description"]
-            incidents = data.get("incidents", [])
-            count = len([i for i in incidents if i["status"] != "resolved"])
-            now = _now_utc()
-            status_cache["history"].append((now, count))
-            status_cache["history"] = status_cache["history"][-288:]
-            last = status_cache["last_status"]
-            if alert_chat and last is not None and last != description:
-                msg = "⚠️ Reddit DOWN!" if "Operational" not in description else "✅ Reddit is back online!"
-                try:
-                    await bot.send_message(chat_id=alert_chat, text=msg)
-                except Exception:
-                    pass
-            status_cache["last_status"] = description
-        except Exception as e:
-            print("auto_check error:", e)
-        await asyncio.sleep(300)
-
+# ---------- Мини HTTP-сервер (для Render Web Service) ----------
 async def health(request):
     return web.Response(text="ok")
 
 async def run_http_server():
     app = web.Application()
     app.router.add_get("/", health)
-    port = int(os.getenv("PORT", "10000"))
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    print(f"HTTP health server on :{PORT}")
 
 
+# ---------- Точка входа ----------
 async def main():
-    asyncio.create_task(run_http_server())   # <— добавили
-    asyncio.create_task(auto_check())
+    if ENABLE_HTTP:
+        asyncio.create_task(run_http_server())
+    print("Bot polling starting...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
